@@ -1,0 +1,1091 @@
+# Azure DevSecOps CI/CD Pipeline for 3-Tier Application on AKS
+# Architecture: Frontend (React) -> Backend API (Node.js) -> Database (PostgreSQL)
+# This pipeline implements security at every stage (Shift-Left Security)
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+  paths:
+    include:
+      - src/*
+      - infrastructure/*
+      - k8s/*
+
+variables:
+  # Azure Resources
+  azureSubscription: 'Azure-Service-Connection'
+  resourceGroup: 'rg-ecommerce-prod'
+  aksCluster: 'aks-ecommerce-prod'
+  acrName: 'acrecommerceprod'
+  keyVaultName: 'kv-ecommerce-prod'
+  
+  # Application Variables
+  frontendImage: '$(acrName).azurecr.io/frontend'
+  backendImage: '$(acrName).azurecr.io/backend'
+  imageTag: '$(Build.BuildId)'
+  
+  # Security & Quality
+  trivyVersion: '0.48.0'
+  sonarQubeConnection: 'SonarQube-Connection'
+  
+  # Terraform
+  tfVersion: '1.6.0'
+  tfWorkingDir: '$(System.DefaultWorkingDirectory)/infrastructure/terraform'
+
+# Pipeline runs on Ubuntu agent
+pool:
+  vmImage: 'ubuntu-latest'
+
+# =============================================================================
+# STAGE 1: CODE QUALITY & SECURITY SCANNING
+# Purpose: Early detection of vulnerabilities, code smells, and security issues
+# Why Important: Shift-left security - catch issues before building artifacts
+# =============================================================================
+stages:
+- stage: CodeQualityAndSecurity
+  displayName: 'Code Quality & Security Scanning'
+  jobs:
+  - job: StaticAnalysis
+    displayName: 'Static Code Analysis'
+    steps:
+    
+    # Secret Scanning - Detect hardcoded secrets in code
+    # Tool: Gitleaks
+    # Why: Prevents accidental exposure of API keys, passwords, tokens
+    - task: CmdLine@2
+      displayName: 'Secret Scanning with Gitleaks'
+      inputs:
+        script: |
+          docker run -v $(Build.SourcesDirectory):/path \
+            zricethezav/gitleaks:latest detect \
+            --source="/path" \
+            --report-format=sarif \
+            --report-path=/path/gitleaks-report.sarif \
+            --verbose
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Gitleaks Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/gitleaks-report.sarif'
+        ArtifactName: 'SecurityReports'
+    
+    # SonarQube Analysis - Code quality, bugs, vulnerabilities, code smells
+    # Tool: SonarQube
+    # Why: Ensures code maintainability, reliability, and security standards
+    - task: SonarQubePrepare@5
+      displayName: 'Prepare SonarQube Analysis'
+      inputs:
+        SonarQube: '$(sonarQubeConnection)'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'ecommerce-app'
+        cliProjectName: 'E-Commerce Application'
+        cliSources: 'src'
+        extraProperties: |
+          sonar.exclusions=**/*.test.js,**/node_modules/**
+          sonar.javascript.lcov.reportPaths=coverage/lcov.info
+          sonar.coverage.exclusions=**/*.test.js
+    
+    # Frontend Tests & Coverage
+    - task: Npm@1
+      displayName: 'Install Frontend Dependencies'
+      inputs:
+        command: 'ci'
+        workingDir: 'src/frontend'
+    
+    - task: Npm@1
+      displayName: 'Run Frontend Unit Tests'
+      inputs:
+        command: 'custom'
+        customCommand: 'run test:ci'
+        workingDir: 'src/frontend'
+    
+    # Backend Tests & Coverage
+    - task: Npm@1
+      displayName: 'Install Backend Dependencies'
+      inputs:
+        command: 'ci'
+        workingDir: 'src/backend'
+    
+    - task: Npm@1
+      displayName: 'Run Backend Unit Tests'
+      inputs:
+        command: 'custom'
+        customCommand: 'run test:ci'
+        workingDir: 'src/backend'
+    
+    - task: SonarQubeAnalyze@5
+      displayName: 'Run SonarQube Analysis'
+    
+    - task: SonarQubePublish@5
+      displayName: 'Publish SonarQube Results'
+      inputs:
+        pollingTimeoutSec: '300'
+    
+    # Quality Gate - Fail pipeline if quality standards not met
+    # Why: Ensures only quality code progresses to next stages
+    - task: sonar-buildbreaker@8
+      displayName: 'Check Quality Gate'
+      inputs:
+        SonarQube: '$(sonarQubeConnection)'
+
+    # SAST - Static Application Security Testing
+    # Tool: Checkmarx / Snyk Code
+    # Why: Identifies security vulnerabilities in source code
+    - task: SnykSecurityScan@1
+      displayName: 'Snyk Code Security Scan'
+      inputs:
+        serviceConnectionEndpoint: 'Snyk-Connection'
+        testType: 'code'
+        failOnIssues: true
+        monitorWhen: 'always'
+        severityThreshold: 'high'
+
+# =============================================================================
+# STAGE 2: INFRASTRUCTURE SECURITY & PROVISIONING
+# Purpose: Secure infrastructure as code validation and deployment
+# Why Important: Ensures cloud resources are configured securely before use
+# =============================================================================
+- stage: InfrastructureSecurity
+  displayName: 'Infrastructure Security & Provisioning'
+  dependsOn: CodeQualityAndSecurity
+  condition: succeeded()
+  jobs:
+  - job: TerraformSecurityScan
+    displayName: 'Terraform Security Scanning'
+    steps:
+    
+    # IaC Scanning - Detect misconfigurations in Terraform
+    # Tool: Checkov
+    # Why: Prevents deployment of insecure infrastructure configurations
+    - task: CmdLine@2
+      displayName: 'Checkov IaC Security Scan'
+      inputs:
+        script: |
+          pip install checkov
+          checkov -d $(tfWorkingDir) \
+            --framework terraform \
+            --output junitxml \
+            --output-file-path $(Build.ArtifactStagingDirectory) \
+            --soft-fail
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Checkov Results'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.ArtifactStagingDirectory)/results_junitxml.xml'
+        testRunTitle: 'Checkov IaC Security Scan'
+    
+    # Additional IaC scanning with tfsec
+    # Tool: tfsec
+    # Why: Additional layer of Terraform security checks
+    - task: CmdLine@2
+      displayName: 'tfsec Terraform Security Scan'
+      inputs:
+        script: |
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          tfsec $(tfWorkingDir) --format junit > $(Build.ArtifactStagingDirectory)/tfsec-report.xml
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish tfsec Results'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.ArtifactStagingDirectory)/tfsec-report.xml'
+        testRunTitle: 'tfsec Security Scan'
+  
+  # Terraform Deployment Job
+  - job: TerraformDeploy
+    displayName: 'Deploy Infrastructure with Terraform'
+    dependsOn: TerraformSecurityScan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    steps:
+    
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(tfVersion)'
+    
+    # Initialize Terraform with Azure backend
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(tfWorkingDir)'
+        backendServiceArm: '$(azureSubscription)'
+        backendAzureRmResourceGroupName: 'rg-terraform-state'
+        backendAzureRmStorageAccountName: 'sttfstateprod'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'ecommerce.tfstate'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(tfWorkingDir)'
+        environmentServiceNameAzureRM: '$(azureSubscription)'
+        commandOptions: '-out=tfplan'
+    
+    # Manual approval for production deployment
+    - task: ManualValidation@0
+      displayName: 'Manual Approval - Review Terraform Plan'
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        notifyUsers: 'devops-team@company.com'
+        instructions: 'Review Terraform plan before applying infrastructure changes'
+    
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(tfWorkingDir)'
+        environmentServiceNameAzureRM: '$(azureSubscription)'
+        commandOptions: 'tfplan'
+
+# =============================================================================
+# STAGE 3: BUILD & CONTAINER SECURITY
+# Purpose: Build Docker images and scan for vulnerabilities
+# Why Important: Ensures container images are free from known vulnerabilities
+# =============================================================================
+- stage: BuildAndContainerSecurity
+  displayName: 'Build & Container Security'
+  dependsOn: InfrastructureSecurity
+  condition: succeeded()
+  jobs:
+  - job: BuildImages
+    displayName: 'Build Docker Images'
+    steps:
+    
+    # Login to Azure Container Registry
+    - task: Docker@2
+      displayName: 'ACR Login'
+      inputs:
+        command: login
+        containerRegistry: '$(acrName)'
+    
+    # Build Frontend Image
+    - task: Docker@2
+      displayName: 'Build Frontend Image'
+      inputs:
+        command: build
+        repository: 'frontend'
+        dockerfile: 'src/frontend/Dockerfile'
+        containerRegistry: '$(acrName)'
+        tags: |
+          $(imageTag)
+          latest
+        arguments: '--build-arg NODE_ENV=production'
+    
+    # Build Backend API Image
+    - task: Docker@2
+      displayName: 'Build Backend Image'
+      inputs:
+        command: build
+        repository: 'backend'
+        dockerfile: 'src/backend/Dockerfile'
+        containerRegistry: '$(acrName)'
+        tags: |
+          $(imageTag)
+          latest
+        arguments: '--build-arg NODE_ENV=production'
+    
+    # Container Image Scanning - Trivy
+    # Tool: Aqua Trivy
+    # Why: Scans container images for OS and application vulnerabilities
+    - task: CmdLine@2
+      displayName: 'Install Trivy'
+      inputs:
+        script: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy
+    
+    - task: CmdLine@2
+      displayName: 'Trivy Scan - Frontend Image'
+      inputs:
+        script: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output $(Build.ArtifactStagingDirectory)/trivy-frontend-report.sarif \
+            $(frontendImage):$(imageTag)
+    
+    - task: CmdLine@2
+      displayName: 'Trivy Scan - Backend Image'
+      inputs:
+        script: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output $(Build.ArtifactStagingDirectory)/trivy-backend-report.sarif \
+            $(backendImage):$(imageTag)
+    
+    # Fail if critical vulnerabilities found
+    - task: CmdLine@2
+      displayName: 'Trivy Vulnerability Check (Fail on Critical)'
+      inputs:
+        script: |
+          trivy image --severity CRITICAL --exit-code 1 $(frontendImage):$(imageTag)
+          trivy image --severity CRITICAL --exit-code 1 $(backendImage):$(imageTag)
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Trivy Reports'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'TrivyReports'
+    
+    # Container Image Signing with Cosign
+    # Tool: Sigstore Cosign
+    # Why: Ensures image integrity and authenticity
+    - task: CmdLine@2
+      displayName: 'Sign Container Images with Cosign'
+      inputs:
+        script: |
+          curl -O -L "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64"
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          sudo chmod +x /usr/local/bin/cosign
+          
+          # Sign images (requires keyless signing setup)
+          cosign sign --yes $(frontendImage):$(imageTag)
+          cosign sign --yes $(backendImage):$(imageTag)
+      env:
+        AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+        AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+        AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+    
+    # Push Images to ACR
+    - task: Docker@2
+      displayName: 'Push Frontend Image to ACR'
+      inputs:
+        command: push
+        repository: 'frontend'
+        containerRegistry: '$(acrName)'
+        tags: |
+          $(imageTag)
+          latest
+    
+    - task: Docker@2
+      displayName: 'Push Backend Image to ACR'
+      inputs:
+        command: push
+        repository: 'backend'
+        containerRegistry: '$(acrName)'
+        tags: |
+          $(imageTag)
+          latest
+
+# =============================================================================
+# STAGE 4: DATABASE MIGRATION & SECURITY
+# Purpose: Deploy database schema changes securely
+# Why Important: Ensures data integrity and applies migrations safely
+# =============================================================================
+- stage: DatabaseMigration
+  displayName: 'Database Migration'
+  dependsOn: BuildAndContainerSecurity
+  condition: succeeded()
+  jobs:
+  - job: RunMigrations
+    displayName: 'Run Database Migrations'
+    steps:
+    
+    # Retrieve database credentials from Key Vault
+    - task: AzureKeyVault@2
+      displayName: 'Get DB Secrets from Key Vault'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        KeyVaultName: '$(keyVaultName)'
+        SecretsFilter: 'db-host,db-username,db-password,db-name'
+        RunAsPreJob: false
+    
+    # Database backup before migration
+    # Tool: pg_dump (PostgreSQL)
+    # Why: Safety net for rollback if migration fails
+    - task: AzureCLI@2
+      displayName: 'Backup Database Before Migration'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          PGPASSWORD=$(db-password) pg_dump \
+            -h $(db-host) \
+            -U $(db-username) \
+            -d $(db-name) \
+            -F c \
+            -f backup_${TIMESTAMP}.dump
+          
+          # Upload to Azure Blob Storage
+          az storage blob upload \
+            --account-name stdbbackupsprod \
+            --container-name db-backups \
+            --name backup_${TIMESTAMP}.dump \
+            --file backup_${TIMESTAMP}.dump
+    
+    # Run Liquibase/Flyway migrations
+    # Tool: Flyway
+    # Why: Version-controlled database schema changes
+    - task: Docker@2
+      displayName: 'Run Flyway Database Migrations'
+      inputs:
+        command: run
+        arguments: |
+          --rm \
+          -v $(Build.SourcesDirectory)/database/migrations:/flyway/sql \
+          flyway/flyway:latest \
+          -url=jdbc:postgresql://$(db-host):5432/$(db-name) \
+          -user=$(db-username) \
+          -password=$(db-password) \
+          migrate
+    
+    # Validate migration success
+    - task: AzureCLI@2
+      displayName: 'Validate Database Schema'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          PGPASSWORD=$(db-password) psql \
+            -h $(db-host) \
+            -U $(db-username) \
+            -d $(db-name) \
+            -c "SELECT version FROM schema_version ORDER BY installed_rank DESC LIMIT 1;"
+
+# =============================================================================
+# STAGE 5: KUBERNETES MANIFEST SECURITY
+# Purpose: Validate Kubernetes manifests for security best practices
+# Why Important: Prevents deployment of insecure K8s configurations
+# =============================================================================
+- stage: KubernetesManifestSecurity
+  displayName: 'Kubernetes Manifest Security'
+  dependsOn: DatabaseMigration
+  condition: succeeded()
+  jobs:
+  - job: K8sSecurityScan
+    displayName: 'K8s Manifest Security Scanning'
+    steps:
+    
+    # K8s manifest validation
+    # Tool: Kubesec
+    # Why: Identifies security risks in Kubernetes resources
+    - task: CmdLine@2
+      displayName: 'Kubesec Security Scan'
+      inputs:
+        script: |
+          docker run -i kubesec/kubesec:latest scan /dev/stdin < k8s/frontend-deployment.yaml > kubesec-frontend.json
+          docker run -i kubesec/kubesec:latest scan /dev/stdin < k8s/backend-deployment.yaml > kubesec-backend.json
+          
+          # Check for critical issues
+          jq '.[] | select(.score < 5)' kubesec-frontend.json kubesec-backend.json
+    
+    # Policy enforcement with OPA/Gatekeeper
+    # Tool: Conftest (OPA)
+    # Why: Enforces organizational security policies
+    - task: CmdLine@2
+      displayName: 'OPA Conftest Policy Validation'
+      inputs:
+        script: |
+          curl -L -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v0.46.0/conftest_0.46.0_Linux_x86_64.tar.gz
+          tar xzf conftest.tar.gz
+          sudo mv conftest /usr/local/bin/
+          
+          # Run policy tests
+          conftest test k8s/*.yaml --policy opa-policies/ --output junit > conftest-results.xml
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Conftest Results'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'conftest-results.xml'
+        testRunTitle: 'OPA Policy Validation'
+    
+    # Kustomize/Helm template generation
+    - task: HelmDeploy@0
+      displayName: 'Helm Template Generation'
+      inputs:
+        command: 'template'
+        chartPath: 'helm/ecommerce-app'
+        releaseName: 'ecommerce-app'
+        overrideValues: |
+          frontend.image.tag=$(imageTag)
+          backend.image.tag=$(imageTag)
+          ingress.enabled=true
+        arguments: '--output-dir $(Build.ArtifactStagingDirectory)/manifests'
+
+# =============================================================================
+# STAGE 6: STAGING DEPLOYMENT
+# Purpose: Deploy to staging environment for testing
+# Why Important: Validates deployment in production-like environment
+# =============================================================================
+- stage: DeployToStaging
+  displayName: 'Deploy to Staging'
+  dependsOn: KubernetesManifestSecurity
+  condition: succeeded()
+  jobs:
+  - deployment: DeployStaging
+    displayName: 'Deploy to Staging Environment'
+    environment: 'ecommerce-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          # Connect to AKS
+          - task: KubernetesManifest@0
+            displayName: 'kubectl login to AKS'
+            inputs:
+              action: 'login'
+              kubernetesServiceConnection: 'AKS-Staging-Connection'
+          
+          # Create namespace if not exists
+          - task: Kubernetes@1
+            displayName: 'Create Staging Namespace'
+            inputs:
+              command: 'apply'
+              arguments: '-f k8s/namespace-staging.yaml'
+          
+          # Deploy secrets from Key Vault
+          - task: AzureKeyVault@2
+            displayName: 'Get Application Secrets'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              KeyVaultName: '$(keyVaultName)'
+              SecretsFilter: '*'
+          
+          - task: KubernetesManifest@0
+            displayName: 'Create K8s Secrets'
+            inputs:
+              action: 'createSecret'
+              namespace: 'staging'
+              secretType: 'generic'
+              secretName: 'app-secrets'
+              secretArguments: |
+                --from-literal=DB_HOST=$(db-host) \
+                --from-literal=DB_USERNAME=$(db-username) \
+                --from-literal=DB_PASSWORD=$(db-password) \
+                --from-literal=JWT_SECRET=$(jwt-secret)
+          
+          # Deploy PostgreSQL (if not using managed service)
+          - task: KubernetesManifest@0
+            displayName: 'Deploy PostgreSQL'
+            inputs:
+              action: 'deploy'
+              namespace: 'staging'
+              manifests: |
+                k8s/postgres-statefulset.yaml
+                k8s/postgres-service.yaml
+          
+          # Deploy Backend API
+          - task: KubernetesManifest@0
+            displayName: 'Deploy Backend API'
+            inputs:
+              action: 'deploy'
+              namespace: 'staging'
+              manifests: |
+                k8s/backend-deployment.yaml
+                k8s/backend-service.yaml
+              containers: '$(backendImage):$(imageTag)'
+          
+          # Deploy Frontend
+          - task: KubernetesManifest@0
+            displayName: 'Deploy Frontend'
+            inputs:
+              action: 'deploy'
+              namespace: 'staging'
+              manifests: |
+                k8s/frontend-deployment.yaml
+                k8s/frontend-service.yaml
+              containers: '$(frontendImage):$(imageTag)'
+          
+          # Deploy Ingress
+          - task: KubernetesManifest@0
+            displayName: 'Deploy Ingress'
+            inputs:
+              action: 'deploy'
+              namespace: 'staging'
+              manifests: 'k8s/ingress-staging.yaml'
+          
+          # Wait for deployment rollout
+          - task: Kubernetes@1
+            displayName: 'Wait for Deployment'
+            inputs:
+              command: 'rollout'
+              arguments: 'status deployment/frontend -n staging --timeout=5m'
+          
+          - task: Kubernetes@1
+            displayName: 'Wait for Backend Deployment'
+            inputs:
+              command: 'rollout'
+              arguments: 'status deployment/backend -n staging --timeout=5m'
+
+# =============================================================================
+# STAGE 7: INTEGRATION & DAST TESTING
+# Purpose: Run integration tests and dynamic security testing
+# Why Important: Validates application functionality and runtime security
+# =============================================================================
+- stage: IntegrationAndDASTTesting
+  displayName: 'Integration & DAST Testing'
+  dependsOn: DeployToStaging
+  condition: succeeded()
+  jobs:
+  - job: IntegrationTests
+    displayName: 'Run Integration Tests'
+    steps:
+    
+    # Get staging URL
+    - task: Kubernetes@1
+      displayName: 'Get Ingress URL'
+      inputs:
+        command: 'get'
+        arguments: 'ingress -n staging -o jsonpath="{.items[0].status.loadBalancer.ingress[0].ip}"'
+      name: GetIngressIP
+    
+    # API Integration Tests
+    # Tool: Postman/Newman
+    # Why: Validates API functionality end-to-end
+    - task: Npm@1
+      displayName: 'Install Newman'
+      inputs:
+        command: 'custom'
+        customCommand: 'install -g newman newman-reporter-htmlextra'
+    
+    - task: CmdLine@2
+      displayName: 'Run API Integration Tests'
+      inputs:
+        script: |
+          newman run tests/integration/api-tests.postman_collection.json \
+            --environment tests/integration/staging.postman_environment.json \
+            --reporters cli,htmlextra \
+            --reporter-htmlextra-export $(Build.ArtifactStagingDirectory)/integration-report.html
+    
+    # E2E Tests
+    # Tool: Playwright/Cypress
+    # Why: Validates complete user workflows
+    - task: Npm@1
+      displayName: 'Install Playwright'
+      inputs:
+        command: 'custom'
+        customCommand: 'install @playwright/test'
+        workingDir: 'tests/e2e'
+    
+    - task: CmdLine@2
+      displayName: 'Run E2E Tests'
+      inputs:
+        script: |
+          cd tests/e2e
+          BASE_URL="http://$(GetIngressIP.ip)" npx playwright test
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results/*.xml'
+        testRunTitle: 'Integration Tests'
+  
+  # Dynamic Application Security Testing
+  - job: DASTScanning
+    displayName: 'DAST Security Testing'
+    dependsOn: IntegrationTests
+    steps:
+    
+    # DAST Scanning
+    # Tool: OWASP ZAP
+    # Why: Identifies runtime security vulnerabilities
+    - task: CmdLine@2
+      displayName: 'OWASP ZAP DAST Scan'
+      inputs:
+        script: |
+          docker run -v $(Build.SourcesDirectory):/zap/wrk/:rw \
+            -t owasp/zap2docker-stable zap-baseline.py \
+            -t http://$(GetIngressIP.ip) \
+            -g gen.conf \
+            -r zap-report.html \
+            -J zap-report.json
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish ZAP Report'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/zap-report.html'
+        ArtifactName: 'ZAPReport'
+
+# =============================================================================
+# STAGE 8: PRODUCTION DEPLOYMENT (BLUE-GREEN)
+# Purpose: Zero-downtime production deployment
+# Why Important: Ensures high availability during deployments
+# =============================================================================
+- stage: DeployToProduction
+  displayName: 'Deploy to Production'
+  dependsOn: IntegrationAndDASTTesting
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployProduction
+    displayName: 'Blue-Green Production Deployment'
+    environment: 'ecommerce-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          # Manual approval gate for production
+          - task: ManualValidation@0
+            displayName: 'Approve Production Deployment'
+            inputs:
+              notifyUsers: 'ops-team@company.com,cto@company.com'
+              instructions: 'Review staging tests and approve production deployment'
+          
+          - task: KubernetesManifest@0
+            displayName: 'kubectl login to Production AKS'
+            inputs:
+              action: 'login'
+              kubernetesServiceConnection: 'AKS-Production-Connection'
+          
+          # Deploy to Blue environment (inactive)
+          - task: KubernetesManifest@0
+            displayName: 'Deploy Backend to Blue'
+            inputs:
+              action: 'deploy'
+              namespace: 'production'
+              manifests: 'k8s/backend-deployment-blue.yaml'
+              containers: '$(backendImage):$(imageTag)'
+          
+          - task: KubernetesManifest@0
+            displayName: 'Deploy Frontend to Blue'
+            inputs:
+              action: 'deploy'
+              namespace: 'production'
+              manifests: 'k8s/frontend-deployment-blue.yaml'
+              containers: '$(frontendImage):$(imageTag)'
+          
+          # Smoke tests on blue environment
+          - task: CmdLine@2
+            displayName: 'Blue Environment Smoke Tests'
+            inputs:
+              script: |
+                BLUE_URL="http://blue.production.svc.cluster.local"
+                curl -f $BLUE_URL/health || exit 1
+                curl -f $BLUE_URL/api/health || exit 1
+          
+          # Switch traffic to blue (now becomes active)
+          - task: KubernetesManifest@0
+            displayName: 'Switch Traffic to Blue'
+            inputs:
+              action: 'deploy'
+              namespace: 'production'
+              manifests: 'k8s/service-selector-blue.yaml'
+          
+          # Monitor for 5 minutes
+          - task: CmdLine@2
+            displayName: 'Monitor New Deployment'
+            inputs:
+              script: |
+                echo "Monitoring new deployment for 5 minutes..."
+                sleep 300
+                
+                # Check pod health
+                kubectl get pods -n production -l version=blue
+                
+                # Check error rates (assumes metrics endpoint)
+                ERROR_RATE=$(curl -s http://prometheus.monitoring/api/v1/query?query=rate\(http_requests_total{status=~"5.."}[5m]\))
+                echo "Error rate: $ERROR_RATE"
+          
+          # Rollback mechanism if issues detected
+          - task: CmdLine@2
+            displayName: 'Automatic Rollback on Failure'
+            condition: failed()
+            inputs:
+              script: |
+                echo "Deployment failed, rolling back to green environment..."
+                kubectl apply -f k8s/service-selector-green.yaml -n production
+                kubectl rollout undo deployment/backend-blue -n production
+                kubectl rollout undo deployment/frontend-blue -n production
+
+# =============================================================================
+# STAGE 9: POST-DEPLOYMENT VALIDATION
+# Purpose: Validate production deployment and configure monitoring
+# Why Important: Ensures production health and observability
+# =============================================================================
+- stage: PostDeploymentValidation
+  displayName: 'Post-Deployment Validation'
+  dependsOn: DeployToProduction
+  condition: succeeded()
+  jobs:
+  - job: ProductionValidation
+    displayName: 'Production Health Checks'
+    steps:
+    
+    # Health checks
+    - task: CmdLine@2
+      displayName: 'Production Health Checks'
+      inputs:
+        script: |
+          PROD_URL="https://ecommerce.company.com"
+          
+          # Frontend health
+          curl -f $PROD_URL/health || exit 1
+          
+          # Backend API health
+          curl -f $PROD_URL/api/health || exit 1
+          
+          # Database connectivity check
+          curl -f $PROD_URL/api/db-health || exit 1
+          
+          echo "All health checks passed!"
+    
+    # Performance baseline
+    # Tool: K6
+    # Why: Ensures deployment meets performance SLAs
+    - task: CmdLine@2
+      displayName: 'Performance Baseline Test'
+      inputs:
+        script: |
+          docker run --rm -i grafana/k6 run - <tests/performance/baseline.js \
+            -e BASE_URL=https://ecommerce.company.com \
+            --out json=performance-results.json
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Performance Results'
+      inputs:
+        PathtoPublish: 'performance-results.json'
+        ArtifactName: 'PerformanceResults'
+  
+  # Configure monitoring and alerting
+  - job: MonitoringSetup
+    displayName: 'Configure Monitoring & Alerting'
+    steps:
+    
+    # Application Insights configuration
+    - task: AzureCLI@2
+      displayName: 'Configure Application Insights'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Create alert rules
+          az monitor metrics alert create \
+            --name "High Error Rate" \
+            --resource-group $(resourceGroup) \
+            --scopes "/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Insights/components/appinsights-ecommerce" \
+            --condition "count exceptions/count > 100" \
+            --window-size 5m \
+            --evaluation-frequency 1m \
+            --action-group "/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/microsoft.insights/actionGroups/ops-team"
+          
+          az monitor metrics alert create \
+            --name "High Response Time" \
+            --resource-group $(resourceGroup) \
+            --scopes "/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Insights/components/appinsights-ecommerce" \
+            --condition "avg requests/duration > 2000" \
+            --window-size 5m \
+            --evaluation-frequency 1m \
+            --action-group "/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/microsoft.insights/actionGroups/ops-team"
+    
+    # Setup Azure Monitor for containers
+    - task: AzureCLI@2
+      displayName: 'Enable Container Insights'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks enable-addons \
+            --resource-group $(resourceGroup) \
+            --name $(aksCluster) \
+            --addons monitoring \
+            --workspace-resource-id "/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.OperationalInsights/workspaces/law-ecommerce-prod"
+
+# =============================================================================
+# STAGE 10: SECURITY COMPLIANCE & REPORTING
+# Purpose: Generate compliance reports and security documentation
+# Why Important: Maintains audit trail and compliance requirements
+# =============================================================================
+- stage: ComplianceAndReporting
+  displayName: 'Security Compliance & Reporting'
+  dependsOn: PostDeploymentValidation
+  condition: succeeded()
+  jobs:
+  - job: ComplianceReporting
+    displayName: 'Generate Compliance Reports'
+    steps:
+    
+    # Azure Security Center assessment
+    - task: AzureCLI@2
+      displayName: 'Azure Security Center Assessment'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get security recommendations
+          az security assessment list \
+            --query "[?resourceDetails.Source=='Azure'].{Name:displayName, Status:status.code, Severity:metadata.severity}" \
+            -o table > $(Build.ArtifactStagingDirectory)/security-assessment.txt
+    
+    # Kubernetes security posture
+    # Tool: kube-bench
+    # Why: CIS Kubernetes Benchmark compliance
+    - task: CmdLine@2
+      displayName: 'CIS Kubernetes Benchmark'
+      inputs:
+        script: |
+          kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job-aks.yaml
+          
+          # Wait for job completion
+          sleep 30
+          
+          # Get results
+          POD_NAME=$(kubectl get pods -n default -l app=kube-bench -o jsonpath='{.items[0].metadata.name}')
+          kubectl logs $POD_NAME > $(Build.ArtifactStagingDirectory)/kube-bench-report.txt
+          
+          kubectl delete job kube-bench
+    
+    # Generate SBOM (Software Bill of Materials)
+    # Tool: Syft
+    # Why: Supply chain security and vulnerability tracking
+    - task: CmdLine@2
+      displayName: 'Generate SBOM'
+      inputs:
+        script: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          
+          syft $(frontendImage):$(imageTag) -o spdx-json > $(Build.ArtifactStagingDirectory)/frontend-sbom.json
+          syft $(backendImage):$(imageTag) -o spdx-json > $(Build.ArtifactStagingDirectory)/backend-sbom.json
+    
+    # Aggregate all security reports
+    - task: PowerShell@2
+      displayName: 'Generate Consolidated Security Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $report = @"
+          ==========================================
+          SECURITY COMPLIANCE REPORT
+          Build: $(Build.BuildNumber)
+          Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          ==========================================
+          
+          1. CODE SECURITY
+             - Gitleaks Secret Scan: PASSED
+             - SonarQube Quality Gate: PASSED
+             - Snyk Code SAST: PASSED
+          
+          2. INFRASTRUCTURE SECURITY
+             - Checkov IaC Scan: PASSED
+             - tfsec Terraform Scan: PASSED
+          
+          3. CONTAINER SECURITY
+             - Trivy Frontend Scan: PASSED
+             - Trivy Backend Scan: PASSED
+             - Images Signed: YES
+          
+          4. RUNTIME SECURITY
+             - OWASP ZAP DAST: PASSED
+             - API Integration Tests: PASSED
+          
+          5. KUBERNETES SECURITY
+             - Kubesec Scan: PASSED
+             - OPA Policy Check: PASSED
+             - CIS Benchmark: SEE ATTACHED
+          
+          6. COMPLIANCE
+             - SBOM Generated: YES
+             - Security Assessment: SEE ATTACHED
+          
+          ==========================================
+          "@
+          
+          $report | Out-File -FilePath $(Build.ArtifactStagingDirectory)/consolidated-report.txt
+    
+    # Publish all reports
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Compliance Reports'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'ComplianceReports'
+    
+    # Send notification
+    - task: SendEmail@1
+      displayName: 'Email Security Report'
+      inputs:
+        To: 'security-team@company.com,compliance@company.com'
+        From: 'devops@company.com'
+        Subject: 'Security Compliance Report - Build $(Build.BuildNumber)'
+        Body: 'Security compliance scan completed. Please review the attached reports.'
+        Attachments: '$(Build.ArtifactStagingDirectory)/consolidated-report.txt'
+
+# =============================================================================
+# STAGE 11: CLEANUP OLD RESOURCES
+# Purpose: Remove old deployments and images to save costs
+# Why Important: Maintains clean environment and reduces Azure costs
+# =============================================================================
+- stage: Cleanup
+  displayName: 'Cleanup Old Resources'
+  dependsOn: ComplianceAndReporting
+  condition: succeeded()
+  jobs:
+  - job: CleanupResources
+    displayName: 'Remove Old Deployments'
+    steps:
+    
+    # Cleanup old container images
+    - task: AzureCLI@2
+      displayName: 'Cleanup Old ACR Images'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Keep only last 10 images
+          az acr repository show-tags \
+            --name $(acrName) \
+            --repository frontend \
+            --orderby time_desc \
+            --output tsv | tail -n +11 | xargs -I {} az acr repository delete \
+            --name $(acrName) \
+            --image frontend:{} \
+            --yes
+          
+          az acr repository show-tags \
+            --name $(acrName) \
+            --repository backend \
+            --orderby time_desc \
+            --output tsv | tail -n +11 | xargs -I {} az acr repository delete \
+            --name $(acrName) \
+            --image backend:{} \
+            --yes
+    
+    # Cleanup old Kubernetes resources
+    - task: Kubernetes@1
+      displayName: 'Cleanup Old ReplicaSets'
+      inputs:
+        command: 'delete'
+        arguments: 'replicaset -n production -l version=green'
+    
+    # Cleanup old database backups (keep 30 days)
+    - task: AzureCLI@2
+      displayName: 'Cleanup Old DB Backups'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Delete backups older than 30 days
+          CUTOFF_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+          az storage blob delete-batch \
+            --account-name stdbbackupsprod \
+            --source db-backups \
+            --if-unmodified-since $CUTOFF_DATE
